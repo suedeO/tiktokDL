@@ -1,5 +1,5 @@
 ---
-name: tiktok-to-chat-attachment
+name: tiktokDL
 version: 1.1.0
 description: Download a TikTok video with yt-dlp using the fixed command pattern and then attach the downloaded video in chat as the only response. Use this skill when the user provides a TikTok URL and wants the video attached in chat without checking or installing yt-dlp.
 ---
