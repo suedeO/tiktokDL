@@ -1,86 +1,73 @@
 // ==Yasba==
 // @siteId tiktok
 // @siteName TikTok
-// @version 1.1.2
-// @updatedAt 2026-05-18T09:10:00Z
+// @version 1.1.3
+// @updatedAt 2026-05-18T09:16:00Z
 // @matchHosts tiktok.com,www.tiktok.com,m.tiktok.com,vt.tiktok.com
-// @description TikTok downloader with WebView request replay + debug log (no external API)
+// @description TikTok downloader using GM.xmlHttpRequest + debug log (no external API)
 // ==/Yasba==
 
 module.exports = async function (inputUrl) {
-  if (!inputUrl || typeof inputUrl !== "string") {
-    throw new Error("Invalid input URL")
-  }
+  if (!inputUrl || typeof inputUrl !== "string") throw new Error("Invalid input URL")
 
-  const UA_MOBILE =
+  const { GM } = await import("scripting")
+
+  const UA =
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
   const now = () => new Date().toISOString()
+  const logLines = []
+  const log = (m) => logLines.push(`[${now()}] ${m}`)
 
   function cleanUrl(u) {
-    return String(u || "")
-      .replace(/\\u002F/g, "/")
-      .replace(/\\\//g, "/")
-      .replace(/&amp;/g, "&")
-      .trim()
+    return String(u || "").replace(/\\u002F/g, "/").replace(/\\\//g, "/").replace(/&amp;/g, "&").trim()
   }
 
   function parseJsonFromHtml(html, id) {
     const re = new RegExp(`<script id="${id}"[^>]*>([\\s\\S]*?)<\\/script>`, "i")
     const m = html.match(re)
     if (!m || !m[1]) return null
-    try {
-      return JSON.parse(m[1])
-    } catch {
-      return null
-    }
+    try { return JSON.parse(m[1]) } catch { return null }
   }
-
-  const logLines = []
-  const log = (msg) => logLines.push(`[${now()}] ${msg}`)
 
   async function flushLog(tag) {
-    try {
-      const outDir = FileManager.documentsDirectory + "/Yasba-Downloads"
-      await FileManager.createDirectory(outDir, true)
-      const path = `${outDir}/tiktok_debug_${Date.now()}_${tag}.log`
-      await FileManager.writeAsString(path, logLines.join("\n"))
-      return path
-    } catch {
-      return null
-    }
-  }
-
-  function pickHeaders(srcHeaders, allowKeys) {
-    const out = {}
-    if (!srcHeaders) return out
-
-    // normalize keys to lowercase lookup
-    const map = {}
-    for (const k of Object.keys(srcHeaders)) {
-      map[String(k).toLowerCase()] = srcHeaders[k]
-    }
-
-    for (const k of allowKeys) {
-      const v = map[k]
-      if (typeof v === "string" && v.trim()) out[k] = v
-    }
-    return out
+    const outDir = FileManager.documentsDirectory + "/Yasba-Downloads"
+    await FileManager.createDirectory(outDir, true)
+    const p = `${outDir}/tiktok_debug_${Date.now()}_${tag}.log`
+    await FileManager.writeAsString(p, logLines.join("\n"))
+    return p
   }
 
   function cookiesToHeader(cookies) {
-    return (cookies || [])
-      .map((c) => `${c.name}=${c.value}`)
-      .join("; ")
+    return (cookies || []).map((c) => `${c.name}=${c.value}`).join("; ")
   }
 
-  // ---------- Step 1: resolve URL + fetch HTML parse ----------
+  function gmDownloadArrayBuffer(url, headers) {
+    return new Promise((resolve, reject) => {
+      GM.xmlHttpRequest({
+        method: "GET",
+        url,
+        headers,
+        timeout: 60_000,
+        responseType: "arraybuffer",
+        onload: (resp) => {
+          const status = resp?.status || 0
+          if (status < 200 || status >= 300) return reject(new Error(`HTTP ${status}`))
+          resolve(resp.response)
+        },
+        onerror: (e) => reject(new Error(`GM XHR error: ${String(e)}`)),
+        ontimeout: () => reject(new Error("GM XHR timeout")),
+      })
+    })
+  }
+
   log(`Input URL: ${inputUrl}`)
 
+  // Resolve
   const resolvedResp = await fetch(inputUrl, {
     method: "GET",
-    headers: { "user-agent": UA_MOBILE, "accept-language": "en-US,en;q=0.9" },
+    headers: { "user-agent": UA, "accept-language": "en-US,en;q=0.9" },
     timeout: 30,
   })
   const resolvedUrl = resolvedResp?.url || inputUrl
@@ -88,249 +75,109 @@ module.exports = async function (inputUrl) {
 
   const candidates = new Set()
 
+  // Parse HTML first
   try {
     const pageResp = await fetch(resolvedUrl, {
       method: "GET",
-      headers: { "user-agent": UA_MOBILE, "accept-language": "en-US,en;q=0.9" },
+      headers: { "user-agent": UA, "accept-language": "en-US,en;q=0.9" },
       timeout: 45,
     })
     log(`Page fetch status: ${pageResp.status}`)
 
     if (pageResp.ok) {
       const html = await pageResp.text()
-
       const uni = parseJsonFromHtml(html, "__UNIVERSAL_DATA_FOR_REHYDRATION__")
-      if (uni) {
-        const v = uni?.__DEFAULT_SCOPE__?.["webapp.reflow.video.detail"]?.itemInfo?.itemStruct?.video
-        if (v?.playAddr) candidates.add(cleanUrl(v.playAddr))
-        if (v?.downloadAddr) candidates.add(cleanUrl(v.downloadAddr))
-        if (v?.playAddrH264) candidates.add(cleanUrl(v.playAddrH264))
-        log(
-          `UNIVERSAL parse: play=${!!v?.playAddr}, download=${!!v?.downloadAddr}, h264=${!!v?.playAddrH264}`
-        )
-      } else {
-        log("UNIVERSAL parse: not found")
-      }
-
-      const sigi = parseJsonFromHtml(html, "SIGI_STATE")
-      if (sigi?.ItemModule && typeof sigi.ItemModule === "object") {
-        const firstKey = Object.keys(sigi.ItemModule)[0]
-        const item = sigi.ItemModule[firstKey]
-        const v = item?.video
-        if (v?.playAddr) candidates.add(cleanUrl(v.playAddr))
-        if (v?.downloadAddr) candidates.add(cleanUrl(v.downloadAddr))
-        if (v?.playAddrH264) candidates.add(cleanUrl(v.playAddrH264))
-        log(
-          `SIGI parse: play=${!!v?.playAddr}, download=${!!v?.downloadAddr}, h264=${!!v?.playAddrH264}`
-        )
-      } else {
-        log("SIGI parse: not found")
-      }
+      const v1 = uni?.__DEFAULT_SCOPE__?.["webapp.reflow.video.detail"]?.itemInfo?.itemStruct?.video
+      if (v1?.playAddr) candidates.add(cleanUrl(v1.playAddr))
+      if (v1?.downloadAddr) candidates.add(cleanUrl(v1.downloadAddr))
+      if (v1?.playAddrH264) candidates.add(cleanUrl(v1.playAddrH264))
     }
   } catch (e) {
-    log(`Page parse error: ${String(e)}`)
+    log(`HTML parse error: ${String(e)}`)
   }
 
-  // ---------- Step 2: WebView capture actual media requests ----------
+  // WebView cookie collection
   let webView = null
-  let capturedMedia = []
-  let pageUrlFromWebView = resolvedUrl
-
+  let pageUrl = resolvedUrl
+  let pageCookieHeader = ""
   try {
     webView = new WebViewController({ ephemeral: false })
-    try { webView.setCustomUserAgent(UA_MOBILE) } catch {}
+    try { webView.setCustomUserAgent(UA) } catch {}
 
-    webView.shouldAllowRequest = async (req) => {
-      const u = String(req.url || "")
-      if (/video\/tos/i.test(u) || /mime_type=video_mp4/i.test(u) || /\.mp4(\?|$)/i.test(u)) {
-        capturedMedia.push({
-          url: u,
-          headers: req.headers || {},
-          method: req.method || "GET",
-        })
-      }
-      return true
-    }
+    await webView.loadURL(resolvedUrl)
+    await webView.waitForLoad()
+    await sleep(2500)
 
-    const loaded = await webView.loadURL(resolvedUrl)
-    log(`WebView loadURL: ${loaded}`)
+    try { pageUrl = await webView.evaluateJavaScript("return location.href") } catch {}
+    const c = await webView.getCookies(pageUrl || resolvedUrl)
+    pageCookieHeader = cookiesToHeader(c)
+    log(`Page cookies: ${c?.length || 0}`)
 
-    if (loaded) {
-      await webView.waitForLoad()
-      await sleep(3000)
-
-      try {
-        pageUrlFromWebView = await webView.evaluateJavaScript("return location.href")
-      } catch {}
-
-      // poke video element to force request
-      try {
-        await webView.evaluateJavaScript(`
-          (function () {
-            const v = document.querySelector('video');
-            if (v) {
-              try { v.muted = true; } catch {}
-              try { v.play(); } catch {}
-            }
-            return !!v;
-          })()
-        `)
-      } catch {}
-
-      await sleep(2500)
-
-      // runtime resource fallback
-      try {
-        const runtimeUrls = await webView.evaluateJavaScript(`
-          (function () {
-            const arr = [];
-            const v = document.querySelector('video');
-            if (v?.src) arr.push(v.src);
-            const entries = performance.getEntriesByType('resource') || [];
-            for (const e of entries) {
-              if (e && e.name && /video\\/tos|mime_type=video_mp4|\\.mp4(\\?|$)/i.test(e.name)) {
-                arr.push(e.name);
-              }
-            }
-            return arr;
-          })()
-        `)
-        for (const u of runtimeUrls || []) candidates.add(cleanUrl(u))
-      } catch (e) {
-        log(`Runtime resource parse error: ${String(e)}`)
-      }
-
-      for (const x of capturedMedia) candidates.add(cleanUrl(x.url))
-      log(`Captured media requests: ${capturedMedia.length}`)
-    }
+    // runtime video src fallback
+    const runtimeSrc = await webView.evaluateJavaScript(`
+      (function(){ const v=document.querySelector('video'); return v?.src || ""; })()
+    `)
+    if (runtimeSrc) candidates.add(cleanUrl(runtimeSrc))
   } catch (e) {
-    log(`WebView capture error: ${String(e)}`)
+    log(`WebView stage error: ${String(e)}`)
   }
 
   const candidateList = [...candidates].filter(Boolean)
   log(`Candidate count: ${candidateList.length}`)
-  candidateList.slice(0, 5).forEach((u, i) => log(`Candidate[${i}]: ${u.slice(0, 220)}`))
+  candidateList.forEach((u, i) => log(`Candidate[${i}]: ${u.slice(0, 220)}`))
 
   if (!candidateList.length) {
-    const p = await flushLog("no_candidates")
-    throw new Error(`Could not extract any TikTok video URL candidate${p ? ` (log: ${p})` : ""}`)
+    const lp = await flushLog("no_candidates")
+    throw new Error(`Could not extract any TikTok video URL candidate (log: ${lp})`)
   }
 
-  // ---------- Step 3: Build cookie headers ----------
-  let cookieHeaderPage = ""
-  let cookieHeaderVideo = ""
-
-  try {
-    if (webView) {
-      const c1 = await webView.getCookies(pageUrlFromWebView || resolvedUrl)
-      cookieHeaderPage = cookiesToHeader(c1)
-      log(`Page cookies: ${c1?.length || 0}`)
-    }
-  } catch (e) {
-    log(`getCookies(page) error: ${String(e)}`)
-  }
-
-  // ---------- Step 4: replay attempts ----------
+  // Try GM.xmlHttpRequest download
   let lastErr = "Unknown"
-  let attemptNo = 0
-
   for (const videoUrl of candidateList) {
-    // try per-video cookies too
+    // host-specific cookies
+    let videoCookieHeader = ""
     try {
       if (webView) {
-        const c2 = await webView.getCookies(videoUrl)
-        cookieHeaderVideo = cookiesToHeader(c2)
-        log(`Video cookies for host ${videoUrl.split("/")[2]}: ${c2?.length || 0}`)
+        const vc = await webView.getCookies(videoUrl)
+        videoCookieHeader = cookiesToHeader(vc)
+        log(`Video cookies: ${vc?.length || 0}`)
       }
-    } catch (e) {
-      log(`getCookies(video) error: ${String(e)}`)
-    }
+    } catch {}
 
-    const capturedForThis = capturedMedia.find((x) => cleanUrl(x.url) === cleanUrl(videoUrl))
-    const replayBaseHeaders = capturedForThis
-      ? pickHeaders(capturedForThis.headers, [
-          "accept",
-          "accept-encoding",
-          "accept-language",
-          "range",
-          "sec-fetch-dest",
-          "sec-fetch-mode",
-          "sec-fetch-site",
-        ])
-      : {}
+    const cookie = videoCookieHeader || pageCookieHeader
 
-    const profiles = [
-      {
-        ...replayBaseHeaders,
-        "user-agent": UA_MOBILE,
-        referer: "https://www.tiktok.com/",
-        ...(cookieHeaderVideo ? { cookie: cookieHeaderVideo } : {}),
-      },
-      {
-        ...replayBaseHeaders,
-        "user-agent": UA_MOBILE,
-        referer: pageUrlFromWebView || resolvedUrl,
-        ...(cookieHeaderVideo ? { cookie: cookieHeaderVideo } : {}),
-      },
-      {
-        ...replayBaseHeaders,
-        "user-agent": UA_MOBILE,
-        referer: "https://www.tiktok.com/",
-        ...(cookieHeaderPage ? { cookie: cookieHeaderPage } : {}),
-      },
-      {
-        ...replayBaseHeaders,
-        "user-agent": UA_MOBILE,
-        referer: pageUrlFromWebView || resolvedUrl,
-        origin: "https://www.tiktok.com",
-        ...(cookieHeaderVideo || cookieHeaderPage
-          ? { cookie: cookieHeaderVideo || cookieHeaderPage }
-          : {}),
-      },
+    const headerProfiles = [
+      { "user-agent": UA, referer: "https://www.tiktok.com/", ...(cookie ? { cookie } : {}) },
+      { "user-agent": UA, referer: pageUrl || resolvedUrl, ...(cookie ? { cookie } : {}) },
+      { "user-agent": UA, referer: "https://www.tiktok.com/", origin: "https://www.tiktok.com", ...(cookie ? { cookie } : {}) },
     ]
 
-    for (let i = 0; i < profiles.length; i++) {
-      attemptNo++
-      const headers = profiles[i]
+    for (let i = 0; i < headerProfiles.length; i++) {
       try {
-        const resp = await fetch(videoUrl, {
-          method: "GET",
-          headers,
-          timeout: 60,
-        })
+        log(`Try GM XHR: candidate=${candidateList.indexOf(videoUrl)+1}, profile=${i+1}`)
+        const ab = await gmDownloadArrayBuffer(videoUrl, headerProfiles[i])
+        const bytes = new Uint8Array(ab)
+        log(`GM XHR bytes: ${bytes.length}`)
 
-        log(`Attempt#${attemptNo} profile=${i + 1} status=${resp.status}`)
-
-        if (!resp.ok) {
-          lastErr = `HTTP ${resp.status}`
-          continue
-        }
-
-        const bytes = new Uint8Array(await resp.arrayBuffer())
-        log(`Attempt#${attemptNo} bytes=${bytes.length}`)
-
-        if (!bytes.length) {
-          lastErr = "Empty response body"
-          continue
-        }
+        if (!bytes.length) throw new Error("Empty body")
 
         const outDir = FileManager.documentsDirectory + "/Yasba-Downloads"
         await FileManager.createDirectory(outDir, true)
-
         const outPath = `${outDir}/tiktok_${Date.now()}.mp4`
         await FileManager.writeAsBytes(outPath, bytes)
 
-        const logPath = await flushLog("success")
-        // You can inspect logPath later from Files app if needed.
+        const lp = await flushLog("success")
+        log(`Saved: ${outPath}; Log: ${lp}`)
+        try { webView?.dispose() } catch {}
         return outPath
       } catch (e) {
         lastErr = String(e)
-        log(`Attempt#${attemptNo} error=${lastErr}`)
+        log(`Try failed: ${lastErr}`)
       }
     }
   }
 
-  const logPath = await flushLog("failed")
+  const lp = await flushLog("failed")
   try { webView?.dispose() } catch {}
-  throw new Error(`All download attempts failed: ${lastErr}${logPath ? ` (log: ${logPath})` : ""}`)
+  throw new Error(`All download attempts failed: ${lastErr} (log: ${lp})`)
 }
